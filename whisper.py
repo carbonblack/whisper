@@ -87,8 +87,15 @@ valueFormat = "!d"
 valueSize = struct.calcsize(valueFormat)
 pointFormat = "!Ld"
 pointSize = struct.calcsize(pointFormat)
-metadataFormat = "!2LfL"
+
+fixedMetadataFormat = "!2LfL"
+fixedMetadataSize = struct.calcsize(fixedMetadataFormat)
+writableMetadataFormat = "!L"
+writableMetadataSize = struct.calcsize(writableMetadataFormat)
+metadataFormat = "!" + fixedMetadataFormat[1:] + writableMetadataFormat[1:]
 metadataSize = struct.calcsize(metadataFormat)
+assert metadataSize == fixedMetadataSize + writableMetadataSize
+
 archiveInfoFormat = "!3L"
 archiveInfoSize = struct.calcsize(archiveInfoFormat)
 
@@ -207,6 +214,60 @@ def enableDebug():
     debug("%s took %.5f seconds" % (name,time.time() - __timingBlocks.pop(name)))
 
 
+
+class FileHeader(object):
+    def __init__(self, fh, header_data):
+        self._fh = fh
+        self.aggregationMethod = header_data["aggregationMethod"]
+        self.maxRetention = header_data["maxRetention"]
+        self.xFilesFactor = header_data["xFilesFactor"]
+        self.maxTime = header_data["maxTime"]
+        self.archives = [ArchiveInfo(archive_info)
+                         for archive_info in header_data["archives"]]
+
+    def __getitem__(self, item):
+        return getattr(self, item)
+
+    @property
+    def minTime(self):
+        return self.maxTime - self.maxRetention
+
+    def updateMaxTime(self, newMaxTime, preserve_fp=True):
+        if newMaxTime <= self.maxTime:
+            return
+
+        originalOffset = self._fh.tell() if preserve_fp else None
+
+        self._fh.seek(fixedMetadataSize)
+        self._fh.write(struct.pack(writableMetadataFormat, newMaxTime))
+
+        self.maxTime = newMaxTime
+        if originalOffset is not None:
+            self._fh.seek(originalOffset)
+
+
+class ArchiveInfo(object):
+    def __init__(self, archive_data):
+        self.offset = archive_data["offset"]
+        self.secondsPerPoint = archive_data["secondsPerPoint"]
+        self.points = archive_data["points"]
+        self.retention = archive_data["retention"]
+        self.size = archive_data["size"]
+
+    def __getitem__(self, item):
+        return getattr(self, item)
+
+    def __ne__(self, other):
+        return not self == other
+
+    def __eq__(self, other):
+        return self.offset == other.offset and \
+               self.secondsPerPoint == other.secondsPerPoint and \
+               self.points == other.points and \
+               self.retention == other.retention and \
+               self.size == other.size
+
+
 def __readHeader(fh):
   if CACHE_HEADERS:
     info = __headerCache.get(fh.name)
@@ -218,7 +279,7 @@ def __readHeader(fh):
   packedMetadata = fh.read(metadataSize)
 
   try:
-    (aggregationType, maxRetention, xff, archiveCount) = struct.unpack(metadataFormat, packedMetadata)
+    aggregationType, maxRetention, xff, archiveCount, maxTime = struct.unpack(metadataFormat,packedMetadata)
   except:
     raise CorruptWhisperFile("Unable to read header", fh.name)
 
@@ -246,11 +307,13 @@ def __readHeader(fh):
     'maxRetention' : maxRetention,
     'xFilesFactor' : xff,
     'archives' : archives,
+    'maxTime': maxTime
   }
   if CACHE_HEADERS:
+    assert False, "With addition of 'maxTime' we can no longer use this implementation of caching the header"
     __headerCache[fh.name] = info
 
-  return info
+  return FileHeader(fh, info)
 
 
 def setAggregationMethod(path, aggregationMethod, xFilesFactor=None):
@@ -264,10 +327,10 @@ xFilesFactor specifies the fraction of data points in a propagation interval tha
     if LOCK:
       fcntl.flock( fh.fileno(), fcntl.LOCK_EX )
 
-    packedMetadata = fh.read(metadataSize)
+    packedMetadata = fh.read(fixedMetadataSize)
 
     try:
-      (aggregationType,maxRetention,xff,archiveCount) = struct.unpack(metadataFormat,packedMetadata)
+      (aggregationType,maxRetention,xff,archiveCount) = struct.unpack(fixedMetadataFormat,packedMetadata)
     except (struct.error, ValueError):
       raise CorruptWhisperFile("Unable to read header", fh.name)
 
@@ -384,7 +447,8 @@ aggregationMethod specifies the function to use when propagating data (see ``whi
     maxRetention = struct.pack( longFormat, oldest )
     xFilesFactor = struct.pack( floatFormat, float(xFilesFactor) )
     archiveCount = struct.pack(longFormat, len(archiveList))
-    packedMetadata = aggregationType + maxRetention + xFilesFactor + archiveCount
+    maxTime = struct.pack(longFormat, 0)
+    packedMetadata = aggregationType + maxRetention + xFilesFactor + archiveCount + maxTime
     fh.write(packedMetadata)
     headerSize = metadataSize + (archiveInfoSize * len(archiveList))
     archiveOffsetPointer = headerSize
@@ -572,6 +636,8 @@ def file_update(fh, value, timestamp):
       break
     higher = lower
 
+  header.updateMaxTime(timestamp, preserve_fp=False)
+
   if AUTOFLUSH:
     fh.flush()
     os.fsync(fh.fileno())
@@ -623,6 +689,8 @@ def file_update_many(fh, points):
   if currentArchive and currentPoints: #don't forget to commit after we've checked all the archives
     currentPoints.reverse()
     __archive_update_many(fh,header,currentArchive,currentPoints)
+
+  header.updateMaxTime(points[0][0], preserve_fp=False)
 
   if AUTOFLUSH:
     fh.flush()
@@ -714,6 +782,7 @@ def info(path):
     pass
   return None
 
+
 def fetch(path,fromTime,untilTime=None,now=None):
   """fetch(path,fromTime,untilTime=None)
 
@@ -745,21 +814,23 @@ def file_fetch(fh, fromTime, untilTime, now=None):
   if fromTime > untilTime:
     raise InvalidTimeInterval("Invalid time interval: from time '%s' is after until time '%s'" % (fromTime, untilTime))
 
-  oldestTime = now - header['maxRetention']
+  # The file has no data
+  if header.maxTime == 0:
+      return None
   # Range is in the future
-  if fromTime > now:
+  if fromTime > header.maxTime:
     return None
   # Range is beyond retention
-  if untilTime < oldestTime:
+  if untilTime < header.minTime:
     return None
   # Range requested is partially beyond retention, adjust
-  if fromTime < oldestTime:
-    fromTime = oldestTime
+  if fromTime < header.minTime:
+    fromTime = header.minTime
   # Range is partially in the future, adjust
-  if untilTime > now:
-    untilTime = now
+  if untilTime > header.maxTime:
+    untilTime = header.maxTime
 
-  diff = now - fromTime
+  diff = header.maxTime - fromTime
   for archive in header['archives']:
     if archive['retention'] >= diff:
       break

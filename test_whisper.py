@@ -404,6 +404,9 @@ class TestWhisper(WhisperTestBase):
         with AssertRaisesException(whisper.InvalidTimeInterval(msg.format(now, past))):
             whisper.fetch(self.filename, now, past)
 
+        whisper.update(self.db, 0, time.time() - 86400 * 7)
+        whisper.update(self.db, 0, time.time())
+
         fetch = whisper.fetch(self.filename, 0)
 
         # check time range
