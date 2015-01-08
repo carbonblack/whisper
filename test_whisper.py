@@ -1,7 +1,6 @@
 #!/usr/bin/env python
 
 import os
-import sys
 import time
 import math
 import random
@@ -39,6 +38,7 @@ class SimulatedCorruptWhisperFile(object):
         self.corrupt_archive = corrupt_archive
 
         self.metadataFormat = whisper.metadataFormat
+        self.fixedMetadataFormat = whisper.fixedMetadataFormat
         self.archiveInfoFormat = whisper.archiveInfoFormat
 
     def __enter__(self):
@@ -46,11 +46,13 @@ class SimulatedCorruptWhisperFile(object):
         # format. This simulates an actual corrupted whisper file
         if not self.corrupt_archive:
             whisper.metadataFormat = '!ssss'
+            whisper.fixedMetadataFormat = '!ssss'
         else:
             whisper.archiveInfoFormat = '!ssss'
 
     def __exit__(self, *args, **kwargs):
         whisper.metadataFormat = self.metadataFormat
+        whisper.fixedMetadataFormat = self.fixedMetadataFormat
         whisper.archiveInfoFormat = self.archiveInfoFormat
 
 
@@ -75,11 +77,11 @@ class AssertRaisesException(object):
     def __exit__(self, e_type, e_value, tracebck):
         # Ensure an exception was actually raised
         if e_type is None:
-            raise AssertionError("Exception of type '{}' was not raised".format(
+            raise AssertionError("Exception of type '{0}' was not raised".format(
                 self.expected_exc.__class__.__name__,
             ))
         elif not isinstance(self.expected_exc, e_type):
-            raise AssertionError("Exception type '{}' is not of type '{}'".format(
+            raise AssertionError("Exception type '{0}' is not of type '{1}'".format(
                 getattr(e_type, '__name__', 'None'),
                 self.expected_exc.__class__.__name__,
             ))
@@ -89,14 +91,14 @@ class AssertRaisesException(object):
         # that all of the kwargs such as path for exceptions
         # such as CorruptWhisperFile are the exact same.
         elif e_value.__dict__ != self.expected_exc.__dict__:
-            raise AssertionError("'{}' != '{}'".format(
+            raise AssertionError("'{0}' != '{1}'".format(
                 repr(self.expected_exc.__dict__),
                 repr(e_value.__dict__),
             ))
         # Some builtin exceptions such as ValueError return {} for
         # ValueError.__dict__, so finally, cast those to strings to compare
         elif str(e_value) != str(self.expected_exc):
-            raise AssertionError("String forms of: '{}' != '{}'".format(
+            raise AssertionError("String forms of: '{0}' != '{1}'".format(
                 str(self.expected_exc),
                 str(e_value),
             ))
@@ -110,8 +112,13 @@ class WhisperTestBase(unittest.TestCase):
         self.filename = 'db.wsp'
         self.retention = [(1, 60), (60, 60)]
 
-    def tearDown(self):
+        # If previous tests failed or were interrupted, let's make sure this file
+        # ain't around for next tests to fail
         self._remove(self.filename)
+        self._remove("test-%s" % self.filename)
+
+    def tearDown(self):
+        pass
 
     @staticmethod
     def _remove(wsp_file):
@@ -237,7 +244,17 @@ class TestWhisper(WhisperTestBase):
         Test some of the edge cases in file_fetch() that should return
         None or raise an exception
         """
+
+        # Let's use one "now" constant to use for duration of entire test
+        now = int(time.time())
+
         whisper.create(self.filename, [(1, 60)])
+
+        # The way this test is coded it assumes that time.time() will never return a number where
+        # fractional part is 0 and most of the time that assumption will probably hold true. However,
+        # by forcing 'now' to int and then adding the fraction part will make this test true 100%
+        # of the time
+        whisper.update(self.filename, 666, now + 0.123456)
 
         with open(self.filename) as fh:
             msg = "Invalid time interval: from time '{0}' is after until time '{1}'"
@@ -260,10 +277,9 @@ class TestWhisper(WhisperTestBase):
             )
 
             # untilTime > now, change untilTime to now
-            now = int(time.time())
             self.assertEqual(
                 whisper.file_fetch(fh, fromTime=now, untilTime=now + 200, now=now),
-                ((now + 1, now + 1, 1), []),
+                ((now + 1, now + 1, 1), [None] * 60),
             )
 
     def test_merge(self):
@@ -404,8 +420,8 @@ class TestWhisper(WhisperTestBase):
         with AssertRaisesException(whisper.InvalidTimeInterval(msg.format(now, past))):
             whisper.fetch(self.filename, now, past)
 
-        whisper.update(self.db, 0, time.time() - 86400 * 7)
-        whisper.update(self.db, 0, time.time())
+        whisper.update(self.filename, 0, time.time() - 86400 * 7)
+        whisper.update(self.filename, 0, time.time())
 
         fetch = whisper.fetch(self.filename, 0)
 
@@ -474,17 +490,19 @@ class TestWhisper(WhisperTestBase):
     # TODO: This test method takes more time than virtually every
     #       single other test combined. Profile this code and potentially
     #       fix the underlying reason
+    # -- this test was forcing fsync (AUTOFLUSH=True) with every file OP?  That seems super expensive
+    #    and not sure if we really need transactional integrity here. Profiling might still be a good
+    #    idea but for now I am removing autoflush thing, which did reduce total test run from 193ms to 20ms
     def test_setAggregation(self):
         """
         Create a db, change aggregation, xFilesFactor, then use info() to validate
         """
         original_lock = whisper.LOCK
-        original_caching = whisper.CACHE_HEADERS
         original_autoflush = whisper.AUTOFLUSH
 
         whisper.LOCK = True
-        whisper.AUTOFLUSH = True
-        whisper.CACHE_HEADERS = True
+        whisper.AUTOFLUSH = False       # Was True??
+
         # create a new db with a valid configuration
         whisper.create(self.filename, self.retention)
 
@@ -525,7 +543,6 @@ class TestWhisper(WhisperTestBase):
 
         whisper.LOCK = original_lock
         whisper.AUTOFLUSH = original_autoflush
-        whisper.CACHE_HEADERS = original_caching
 
 
 class TestgetUnitString(unittest.TestCase):
@@ -545,10 +562,8 @@ class TestReadHeader(WhisperTestBase):
     def test_normal(self):
         whisper.create(self.filename, [(1, 60), (60, 60)])
 
-        whisper.CACHE_HEADERS = True
         whisper.info(self.filename)
         whisper.info(self.filename)
-        whisper.CACHE_HEADERS = False
 
 
 class TestParseRetentionDef(unittest.TestCase):
