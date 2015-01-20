@@ -662,13 +662,12 @@ def file_update_many(fh, points):
     fcntl.flock( fh.fileno(), fcntl.LOCK_EX )
 
   header = __readHeader(fh)
-  now = int( time.time() )
   archives = iter( header['archives'] )
   currentArchive = archives.next()
   currentPoints = []
 
   for point in points:
-    age = now - point[0]
+    age = header.maxTime - point[0]
 
     while currentArchive['retention'] < age: #we can't fit any more points in this archive
       if currentPoints: #commit all the points we've found that it can fit
